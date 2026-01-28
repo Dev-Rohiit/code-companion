@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EditorView, keymap, lineNumbers, highlightActiveLineGutter, highlightSpecialChars, drawSelection, dropCursor, rectangularSelection, crosshairCursor, highlightActiveLine } from "@codemirror/view";
 import { EditorState, Compartment } from "@codemirror/state";
 import { javascript } from "@codemirror/lang-javascript";
@@ -11,6 +11,7 @@ import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { autocompletion, completionKeymap, closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
 import { bracketMatching, foldGutter, foldKeymap, indentOnInput, syntaxHighlighting, defaultHighlightStyle } from "@codemirror/language";
 import { motion } from "framer-motion";
+import * as ts from "typescript";
 import { 
   Play, 
   Save, 
@@ -186,6 +187,8 @@ export default function Playground() {
   const editorRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const languageCompartment = useRef(new Compartment());
+  const activeTabRef = useRef<string>("");
+  const tabsRef = useRef<Tab[]>([]);
   
   const [selectedLanguage, setSelectedLanguage] = useState("javascript");
   const [tabs, setTabs] = useState<Tab[]>([
@@ -218,18 +221,21 @@ export default function Playground() {
     }
   }, []);
 
-  const getCurrentTab = useCallback(() => {
+  const currentTab = useMemo(() => {
     return tabs.find(tab => tab.id === activeTab);
   }, [tabs, activeTab]);
 
   useEffect(() => {
-    if (!editorRef.current) return;
+    activeTabRef.current = activeTab;
+    tabsRef.current = tabs;
+  }, [activeTab, tabs]);
 
-    const currentTab = getCurrentTab();
-    if (!currentTab) return;
+  useEffect(() => {
+    if (!editorRef.current) return;
+    if (viewRef.current) return;
 
     const startState = EditorState.create({
-      doc: currentTab.content,
+      doc: "",
       extensions: [
         lineNumbers(),
         highlightActiveLineGutter(),
@@ -254,13 +260,14 @@ export default function Playground() {
           ...foldKeymap,
           ...completionKeymap,
         ]),
-        languageCompartment.current.of(getLanguageExtension(currentTab.language)),
+        languageCompartment.current.of(getLanguageExtension("javascript")),
         oneDark,
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             const newContent = update.state.doc.toString();
-            setTabs(prev => prev.map(tab => 
-              tab.id === activeTab ? { ...tab, content: newContent } : tab
+            const tabId = activeTabRef.current;
+            setTabs(prev => prev.map(tab =>
+              tab.id === tabId ? { ...tab, content: newContent } : tab
             ));
           }
         }),
@@ -293,8 +300,26 @@ export default function Playground() {
 
     return () => {
       view.destroy();
+      viewRef.current = null;
     };
-  }, [activeTab, getLanguageExtension, getCurrentTab]);
+  }, [getLanguageExtension]);
+
+  useEffect(() => {
+    if (!viewRef.current) return;
+    if (!currentTab) return;
+
+    // Keep header language selector in sync with current file.
+    setSelectedLanguage(currentTab.language);
+
+    viewRef.current.dispatch({
+      effects: languageCompartment.current.reconfigure(getLanguageExtension(currentTab.language)),
+      changes: {
+        from: 0,
+        to: viewRef.current.state.doc.length,
+        insert: currentTab.content,
+      },
+    });
+  }, [currentTab, getLanguageExtension]);
 
   const handleLanguageChange = (lang: string) => {
     setSelectedLanguage(lang);
@@ -362,18 +387,65 @@ export default function Playground() {
     setIsRunning(true);
     setOutput(prev => [...prev, "", `> Running ${selectedLanguage} code...`]);
     
-    // Simulate code execution
-    await new Promise(resolve => setTimeout(resolve, 500));
-    
-    const currentTab = getCurrentTab();
-    if (currentTab) {
-      // Mock output - in real implementation, this would call the backend
+    const startedAt = performance.now();
+    const tab = tabsRef.current.find(t => t.id === activeTabRef.current);
+    const code = viewRef.current?.state.doc.toString() ?? tab?.content ?? "";
+
+    try {
+      if (selectedLanguage !== "javascript" && selectedLanguage !== "typescript") {
+        throw new Error(`Runner not implemented for ${selectedLanguage} yet. Try JavaScript/TypeScript for now.`);
+      }
+
+      const logs: string[] = [];
+      const originalLog = console.log;
+      const originalError = console.error;
+
+      console.log = (...args: unknown[]) => {
+        logs.push(args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+        originalLog(...args);
+      };
+      console.error = (...args: unknown[]) => {
+        logs.push(args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+        originalError(...args);
+      };
+
+      try {
+        const runnable =
+          selectedLanguage === "typescript"
+            ? ts.transpileModule(code, {
+                compilerOptions: {
+                  target: ts.ScriptTarget.ES2020,
+                  module: ts.ModuleKind.ESNext,
+                  jsx: ts.JsxEmit.ReactJSX,
+                },
+              }).outputText
+            : code;
+
+        // Execute in a function scope (no imports, browser APIs available).
+        // eslint-disable-next-line no-new-func
+        const fn = new Function(runnable);
+        fn();
+      } finally {
+        console.log = originalLog;
+        console.error = originalError;
+      }
+
+      const elapsed = Math.round(performance.now() - startedAt);
       setOutput(prev => [
         ...prev,
-        "Hello, World! Welcome to CodeCraft.",
+        ...(logs.length ? logs : ["(no output)"]),
         "",
         `✓ Code executed successfully`,
-        `  Execution time: ${Math.floor(Math.random() * 100) + 10}ms`,
+        `  Execution time: ${elapsed}ms`,
+      ]);
+    } catch (err) {
+      const elapsed = Math.round(performance.now() - startedAt);
+      const message = err instanceof Error ? err.message : String(err);
+      setOutput(prev => [
+        ...prev,
+        `✗ ${message}`,
+        "",
+        `  Execution time: ${elapsed}ms`,
       ]);
     }
     
@@ -381,7 +453,7 @@ export default function Playground() {
   };
 
   const saveCode = () => {
-    const currentTab = getCurrentTab();
+    const currentTab = tabs.find(tab => tab.id === activeTab);
     if (currentTab) {
       localStorage.setItem(`codecraft_${currentTab.id}`, JSON.stringify(currentTab));
       toast({
