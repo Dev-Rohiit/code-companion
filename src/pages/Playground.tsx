@@ -189,6 +189,8 @@ export default function Playground() {
   const languageCompartment = useRef(new Compartment());
   const activeTabRef = useRef<string>("");
   const tabsRef = useRef<Tab[]>([]);
+  const lastAppliedTabIdRef = useRef<string | null>(null);
+  const lastAppliedLanguageRef = useRef<string | null>(null);
   
   const [selectedLanguage, setSelectedLanguage] = useState("javascript");
   const [tabs, setTabs] = useState<Tab[]>([
@@ -308,17 +310,34 @@ export default function Playground() {
     if (!viewRef.current) return;
     if (!currentTab) return;
 
-    // Keep header language selector in sync with current file.
-    setSelectedLanguage(currentTab.language);
+    const view = viewRef.current;
+    const editorText = view.state.doc.toString();
+    const tabChanged = lastAppliedTabIdRef.current !== currentTab.id;
+    const languageChanged = lastAppliedLanguageRef.current !== currentTab.language;
 
-    viewRef.current.dispatch({
+    // Only sync editor from state when switching files / changing language, or
+    // if something external changed the tab content (e.g. load/reset).
+    // Avoid re-dispatching the full document on every keystroke (it resets selection).
+    if (!tabChanged && !languageChanged && editorText === currentTab.content) return;
+
+    // Keep header language selector in sync with current file (but only when needed).
+    if (tabChanged || languageChanged) setSelectedLanguage(currentTab.language);
+
+    view.dispatch({
       effects: languageCompartment.current.reconfigure(getLanguageExtension(currentTab.language)),
-      changes: {
-        from: 0,
-        to: viewRef.current.state.doc.length,
-        insert: currentTab.content,
-      },
+      ...(editorText === currentTab.content
+        ? {}
+        : {
+            changes: {
+              from: 0,
+              to: view.state.doc.length,
+              insert: currentTab.content,
+            },
+          }),
     });
+
+    lastAppliedTabIdRef.current = currentTab.id;
+    lastAppliedLanguageRef.current = currentTab.language;
   }, [currentTab, getLanguageExtension]);
 
   const handleLanguageChange = (lang: string) => {
@@ -386,71 +405,112 @@ export default function Playground() {
   const runCode = async () => {
     setIsRunning(true);
     setOutput(prev => [...prev, "", `> Running ${selectedLanguage} code...`]);
-    
+  
     const startedAt = performance.now();
     const tab = tabsRef.current.find(t => t.id === activeTabRef.current);
-    const code = viewRef.current?.state.doc.toString() ?? tab?.content ?? "";
-
-    try {
-      if (selectedLanguage !== "javascript" && selectedLanguage !== "typescript") {
-        throw new Error(`Runner not implemented for ${selectedLanguage} yet. Try JavaScript/TypeScript for now.`);
-      }
-
-      const logs: string[] = [];
-      const originalLog = console.log;
-      const originalError = console.error;
-
-      console.log = (...args: unknown[]) => {
-        logs.push(args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
-        originalLog(...args);
-      };
-      console.error = (...args: unknown[]) => {
-        logs.push(args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
-        originalError(...args);
-      };
-
-      try {
-        const runnable =
-          selectedLanguage === "typescript"
-            ? ts.transpileModule(code, {
-                compilerOptions: {
-                  target: ts.ScriptTarget.ES2020,
-                  module: ts.ModuleKind.ESNext,
-                  jsx: ts.JsxEmit.ReactJSX,
-                },
-              }).outputText
-            : code;
-
-        // Execute in a function scope (no imports, browser APIs available).
-        // eslint-disable-next-line no-new-func
-        const fn = new Function(runnable);
-        fn();
-      } finally {
-        console.log = originalLog;
-        console.error = originalError;
-      }
-
-      const elapsed = Math.round(performance.now() - startedAt);
-      setOutput(prev => [
-        ...prev,
-        ...(logs.length ? logs : ["(no output)"]),
-        "",
-        `✓ Code executed successfully`,
-        `  Execution time: ${elapsed}ms`,
-      ]);
-    } catch (err) {
-      const elapsed = Math.round(performance.now() - startedAt);
-      const message = err instanceof Error ? err.message : String(err);
-      setOutput(prev => [
-        ...prev,
-        `✗ ${message}`,
-        "",
-        `  Execution time: ${elapsed}ms`,
-      ]);
+    let code = viewRef.current?.state.doc.toString() ?? tab?.content ?? "";
+  
+    if (selectedLanguage !== "javascript" && selectedLanguage !== "typescript") {
+      setOutput(prev => [...prev, `✗ Runner not implemented for ${selectedLanguage}`]);
+      setIsRunning(false);
+      return;
     }
-    
-    setIsRunning(false);
+  
+    if (selectedLanguage === "typescript") {
+      code = ts.transpileModule(code, {
+        compilerOptions: {
+          target: ts.ScriptTarget.ES2020,
+          module: ts.ModuleKind.ESNext,
+          jsx: ts.JsxEmit.ReactJSX,
+        },
+      }).outputText;
+    }
+  
+    // Remove previous iframe
+    if ((window as any).__codecraftIframe) {
+      (window as any).__codecraftIframe.remove();
+      (window as any).__codecraftIframe = null;
+    }
+  
+    const iframe = document.createElement("iframe");
+    iframe.sandbox.add("allow-scripts");
+    iframe.style.display = "none";
+  
+    // srcdoc for async-friendly execution
+    iframe.srcdoc = `
+      <!DOCTYPE html>
+      <html>
+      <body>
+      <script>
+        const send = (type, args = []) => {
+          parent.postMessage({ source: "codecraft", type, args }, "*");
+        };
+  
+        // Wrap console
+        ["log", "error", "warn", "info", "debug"].forEach(method => {
+          const original = console[method];
+          console[method] = (...args) => {
+            send(method, args);
+            original.apply(console, args);
+          };
+        });
+  
+        window.onerror = (msg, src, line, col, err) => {
+          send("error", [msg + " (" + line + ":" + col + ")"]);
+        };
+  
+        window.onunhandledrejection = event => {
+          send("error", ["Unhandled Promise rejection: " + (event.reason?.message || event.reason)]);
+        };
+  
+        // Execute user code
+        (async () => {
+          try {
+            ${code}
+            // Do NOT send done immediately
+            // Instead, you can send a "scheduled" done after a delay if you want
+            setTimeout(() => send("done"), 5000); // optional safety timeout
+          } catch (e) {
+            send("error", [e?.message || String(e)]);
+            send("done");
+          }
+        })();
+      </script>
+      </body>
+      </html>
+    `;
+  
+    document.body.appendChild(iframe);
+    (window as any).__codecraftIframe = iframe;
+  
+    const handler = (e: MessageEvent) => {
+      if (e.data?.source !== "codecraft") return;
+  
+      if (["log", "warn", "error", "info", "debug"].includes(e.data.type)) {
+        setOutput(prev => [
+          ...prev,
+          e.data.args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" "),
+        ]);
+      }
+  
+      if (e.data.type === "done") {
+        const elapsed = Math.round(performance.now() - startedAt);
+        setOutput(prev => [
+          ...prev,
+          "",
+          `✓ Code execution complete`,
+          `  Execution time: ${elapsed}ms`,
+        ]);
+        setIsRunning(false);
+        window.removeEventListener("message", handler);
+      }
+    };
+  
+    window.addEventListener("message", handler);
   };
+  
+  
+  
 
   const saveCode = () => {
     const currentTab = tabs.find(tab => tab.id === activeTab);
